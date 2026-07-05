@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+.env
+data/outputs/
+data/*.db
+data/logs/
+config/service_account.json
+*.json.key
