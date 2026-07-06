@@ -108,10 +108,21 @@ masjidos/
 
 ## Known limitations
 
-- **Portal upload is a stub.** `portal_upload()` in `mcp_servers/publishing_server.py`
-  has placeholder Playwright selectors — the actual file-upload step is commented
-  out pending confirmation against the live Masjidal DOM. CSVs are generated
-  correctly either way; `PORTAL_UPLOAD_ENABLED=false` keeps this off by default.
+- **Portal upload is implemented against the real DOM but not yet live-tested
+  end-to-end from an automated run.** `portal_upload()` in
+  `mcp_servers/publishing_server.py` logs into the backend admin, finds the
+  masjid in Mosque Manager, follows "New UI Login" into the mosque-facing
+  portal, and uploads both CSVs via their upload modals — all URLs, form field
+  names, and button labels were confirmed against the live site. Two details
+  are inference rather than confirmed-from-HTML (documented in the function's
+  docstring): which of two same-labeled buttons is the modal's actual submit
+  action, and exact-match assumptions when searching Mosque Manager by name.
+  Test with `PORTAL_HEADLESS=false` first, ideally against a non-critical
+  masjid, before trusting it broadly. `PORTAL_UPLOAD_ENABLED=false` keeps this
+  off by default; CSVs are still generated correctly either way.
+- CSV column headers/format were matched exactly against Masjidal's own
+  downloadable sample templates (`Masjidal_Salah_CSV_Template`,
+  `Masjidal_Iqama_CSV_Template`), not guessed.
 - Batch/spreadsheet mode (`process_directory`) and the Google Sheets integration
   are implemented but lightly tested compared to the single-masjid path.
 - The grounding check is substring-based: it catches outright fabricated values,

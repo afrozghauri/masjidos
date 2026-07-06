@@ -19,8 +19,12 @@ from config.settings import settings  # noqa: E402
 
 mcp = FastMCP("publishing")
 
+# Header text matches Masjidal's own downloadable CSV templates exactly (Salah:
+# Masjidal_Salah_CSV_Template, Iqamah: Masjidal_Iqama_CSV_Template) — confirmed
+# 2026-07, including the verbatim Maghrib/Jumu'ah column labels below.
 SALAH_HEADER = ["Fajr", "Sunrise", "Dhuhr", "Asr", "Maghrib", "Isha"]
-IQAMAH_HEADER = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha", "Jumuah 1", "Jumuah 2"]
+IQAMAH_HEADER = ["Fajr", "Dhuhr", "Asr", "Maghrib (minutes after Salah start time)",
+                 "Isha", "Jumu'ah I", "Jumu'ah II"]
 DATE_INPUT_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%B %d, %Y", "%b %d, %Y", "%d %B %Y")
 
 
@@ -45,9 +49,9 @@ def _fmt_date(raw: str) -> str:
 
 
 def _fmt_time(raw: str) -> str:
-    """Normalize to 12-hour 'H:MM AM/PM' (no leading zero on the hour) so Excel/
-    Sheets recognizes it as a time value, regardless of the source's original
-    casing/format (e.g. '13:11', '1:11pm', '1:11 PM' all -> '1:11 PM')."""
+    """Normalize to zero-padded 12-hour 'HH:MM AM/PM' — matches Masjidal's own
+    sample CSV templates exactly (e.g. '05:16 AM', '12:41 PM'), regardless of the
+    source's original casing/format (e.g. '13:11', '1:11pm', '1:11 PM')."""
     raw = (raw or "").strip()
     if not raw:
         return raw
@@ -55,8 +59,7 @@ def _fmt_time(raw: str) -> str:
     for fmt in ("%I:%M %p", "%I:%M%p", "%H:%M"):
         try:
             dt = datetime.strptime(cleaned, fmt)
-            out = dt.strftime("%I:%M %p")
-            return out[1:] if out.startswith("0") else out
+            return dt.strftime("%I:%M %p")
         except ValueError:
             continue
     return raw  # leave untouched if unrecognized (e.g. already free-form text)
@@ -100,35 +103,90 @@ def generate_iqamah_csv(masjid_name: str, extraction_json: str) -> dict:
 
 
 @mcp.tool()
-def portal_upload(masjid_name: str, salah_csv: str, iqamah_csv: str) -> dict:
-    """Deterministic Playwright automation: login -> Mosque Manager -> search the
-    masjid -> New UI login -> upload the two CSVs. No-op unless PORTAL_UPLOAD_ENABLED."""
+async def portal_upload(masjid_name: str, salah_csv: str, iqamah_csv: str) -> dict:
+    """Deterministic Playwright automation against the REAL Masjidal system,
+    confirmed against the live DOM (2026-07):
+
+    1. Log into the backend admin (masjidal.com/backend/site/login) with
+       PORTAL_EMAIL/PORTAL_PASSWORD.
+    2. Mosque Manager (backend/mosque) -> search by masjid_name -> the matching
+       row's "New UI Login" icon opens a NEW TAB (window.open) that lands,
+       already authenticated via a one-time JWT, on the mosque-facing frontend
+       at portal.masjidal.com/dashboard/.
+    3. On that tab: /timings/salah -> "Upload Timings" -> file chooser ->
+       "Upload"; then /timings/iqama -> "Upload" -> file chooser -> "Upload".
+
+    Two things are inference, not confirmed against raw HTML (no direct DOM
+    access was available while building this — only screenshots): the exact
+    modal "Upload" submit button (there are TWO buttons with overlapping text,
+    the nav button that opens the modal and the modal's own submit button; we
+    take the LAST match on the theory that modals are appended to the DOM
+    after their trigger), and the mosque-name search assumes an exact-match
+    row exists. Test with PORTAL_HEADLESS=false first to watch it run, ideally
+    against a non-critical masjid, before trusting it broadly.
+
+    No-op unless PORTAL_UPLOAD_ENABLED."""
     if not settings.portal_upload_enabled:
         return {"ok": True, "skipped": True,
                 "note": "PORTAL_UPLOAD_ENABLED is false; CSVs generated but not uploaded.",
                 "salah_csv": salah_csv, "iqamah_csv": iqamah_csv}
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=settings.portal_headless)
-            page = browser.new_page()
-            page.goto(settings.portal_login_url, wait_until="networkidle")
-            # NOTE: selectors below are placeholders — confirm against the live DOM.
-            page.fill("input[type=email], input[name*=email]", settings.portal_email)
-            page.fill("input[type=password]", settings.portal_password)
-            page.click("button[type=submit], input[type=submit]")
-            page.wait_for_load_state("networkidle")
-            page.click("text=Mosque Manager")
-            page.fill("input[type=search], input[placeholder*=Name]", masjid_name)
-            page.wait_for_timeout(1500)
-            page.click("text=New UI login")
-            # ... navigate to Salah/Iqamah upload and set the file inputs ...
-            # page.set_input_files("input[type=file]", salah_csv)  # etc.
-            browser.close()
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=settings.portal_headless)
+            context = await browser.new_context()
+            page = await context.new_page()
+
+            await page.goto(settings.portal_login_url, wait_until="networkidle", timeout=30000)
+            await page.fill("input[name='LoginForm[email]']", settings.portal_email)
+            await page.fill("input[name='LoginForm[password]']", settings.portal_password)
+            await page.click("button[type=submit]")
+            await page.wait_for_load_state("networkidle", timeout=30000)
+
+            await page.goto("https://masjidal.com/backend/mosque", wait_until="networkidle", timeout=30000)
+            await page.fill("input[name='MasjidSearch[m_name]']", masjid_name)
+            await page.keyboard.press("Enter")
+            await page.wait_for_load_state("networkidle", timeout=30000)
+
+            rows = await page.query_selector_all("table tbody tr")
+            target_row = None
+            for r in rows:
+                cells = await r.query_selector_all("td")
+                if len(cells) > 1 and (await cells[1].inner_text()).strip().lower() == masjid_name.strip().lower():
+                    target_row = r
+                    break
+            target_row = target_row or (rows[0] if rows else None)
+            if not target_row:
+                return {"ok": False, "error": f"No mosque found in Mosque Manager matching '{masjid_name}'."}
+
+            new_ui_link = await target_row.query_selector("a[href*='backend/portal/login']")
+            if not new_ui_link:
+                return {"ok": False, "error": f"'{masjid_name}' row has no New UI Login link."}
+
+            async with context.expect_page(timeout=20000) as new_page_info:
+                await new_ui_link.click()
+            portal_page = await new_page_info.value
+            await portal_page.wait_for_load_state("networkidle", timeout=30000)
+
+            for url, filename, csv_path in (
+                ("https://portal.masjidal.com/timings/salah", "Upload Timings", salah_csv),
+                ("https://portal.masjidal.com/timings/iqama", "Upload", iqamah_csv),
+            ):
+                await portal_page.goto(url, wait_until="networkidle", timeout=30000)
+                await portal_page.click(f"text={filename}")
+                async with portal_page.expect_file_chooser() as fc_info:
+                    await portal_page.click("text=SELECT CSV FILE")
+                await (await fc_info.value).set_files(csv_path)
+                await portal_page.wait_for_selector(f"text={Path(csv_path).name}", timeout=10000)
+                await portal_page.locator("button:has-text('Upload')").last.click()
+                await portal_page.wait_for_timeout(2000)
+
+            await browser.close()
         return {"ok": True, "uploaded": True, "masjid": masjid_name}
     except Exception as e:
         return {"ok": False, "error": str(e),
-                "hint": "Portal DOM likely changed; verify selectors."}
+                "hint": "Verify against the live DOM — see portal_upload's docstring "
+                        "for which parts are inference vs. confirmed."}
 
 
 if __name__ == "__main__":

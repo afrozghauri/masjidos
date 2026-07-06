@@ -73,7 +73,7 @@ async def process_masjid(name: str, url: str, source: str = "", row_number: int 
         ej = json.dumps(extraction)
         salah = generate_salah_csv(name, ej)
         iqamah = generate_iqamah_csv(name, ej)
-        upload = portal_upload(name, salah["path"], iqamah["path"])
+        upload = await portal_upload(name, salah["path"], iqamah["path"])
         mark = {"ok": False, "error": "no source/row recorded for this item"}
         if source and row_number:
             from mcp_servers.acquisition_server import mark_row_done

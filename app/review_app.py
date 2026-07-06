@@ -98,17 +98,35 @@ for _id, name, status, mc, rationale, ej, item_source, item_row, trace_json in i
                     f"· **Maghrib single column:** {e.get('maghrib_single_column','?')}")
         st.markdown(f"**Agent reasoning:** {e.get('rationale', rationale)}")
 
+        cc = e.get("column_confidence", {})
+        na = e.get("not_applicable", {})
         c1, c2 = st.columns(2)
         with c1:
-            st.subheader("Salah (Athan)")
+            st.subheader("Salah column confidence")
             st.dataframe(pd.DataFrame([
-                {"Prayer": k, "Time": v.get("value"), "Conf": v.get("confidence")}
-                for k, v in e.get("salah", {}).items()]), hide_index=True)
+                {"Column": k, "Confidence": v, "N/A": na.get("salah", {}).get(k, False)}
+                for k, v in cc.get("salah", {}).items()]), hide_index=True)
         with c2:
-            st.subheader("Iqamah (Jamaat)")
+            st.subheader("Iqamah column confidence")
             st.dataframe(pd.DataFrame([
-                {"Prayer": k, "Value": v.get("value"), "Conf": v.get("confidence")}
-                for k, v in e.get("iqamah", {}).items()]), hide_index=True)
+                {"Column": k, "Confidence": v, "N/A": na.get("iqamah", {}).get(k, False)}
+                for k, v in cc.get("iqamah", {}).items()]), hide_index=True)
+
+        jumuah = e.get("jumuah", {})
+        if jumuah:
+            st.caption(f"Jumu'ah I: {jumuah.get('Jumuah 1', '—')} · "
+                       f"Jumu'ah II: {jumuah.get('Jumuah 2', '—')}")
+
+        rows = e.get("rows", [])
+        st.subheader(f"Calendar ({len(rows)} date{'s' if len(rows) != 1 else ''})")
+        if rows:
+            st.dataframe(pd.DataFrame([
+                {"Date": r.get("date"),
+                 **{f"Salah {k}": v for k, v in r.get("salah", {}).items()},
+                 **{f"Iqamah {k}": v for k, v in r.get("iqamah", {}).items()}}
+                for r in rows]), hide_index=True)
+        else:
+            st.caption("No date rows in this extraction.")
 
         with st.expander("🔍 Agent reasoning trace (tool calls in order)"):
             try:
@@ -128,7 +146,7 @@ for _id, name, status, mc, rationale, ej, item_source, item_row, trace_json in i
                 from mcp_servers.acquisition_server import mark_row_done
                 salah = generate_salah_csv(name, ej)
                 iqamah = generate_iqamah_csv(name, ej)
-                up = portal_upload(name, salah["path"], iqamah["path"])
+                up = asyncio.run(portal_upload(name, salah["path"], iqamah["path"]))
 
                 mark = {"ok": False, "error": "no source/row recorded for this item"}
                 if item_source and item_row:

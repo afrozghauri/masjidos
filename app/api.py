@@ -80,7 +80,7 @@ def queue():
 
 
 @app.post("/review/{item_id}/approve", dependencies=[Depends(require_api_key)])
-def approve(item_id: int):
+async def approve(item_id: int):
     """Human approves an item -> generate CSVs, upload, and ONLY THEN mark the
     source row as Done (Google Sheet or local file)."""
     from mcp_servers.acquisition_server import mark_row_done
@@ -93,7 +93,7 @@ def approve(item_id: int):
     ej = item.extraction_json
     salah = generate_salah_csv(item.masjid_name, ej)
     iqamah = generate_iqamah_csv(item.masjid_name, ej)
-    up = portal_upload(item.masjid_name, salah["path"], iqamah["path"])
+    up = await portal_upload(item.masjid_name, salah["path"], iqamah["path"])
 
     mark = {"ok": False, "error": "no source/row recorded for this item"}
     if item.source and item.row_number:
