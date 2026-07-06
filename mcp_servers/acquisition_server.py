@@ -214,6 +214,47 @@ async def fetch_rendered_html(url: str) -> dict:
     }
 
 
+_MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July",
+                "August", "September", "October", "November", "December"]
+_MONTH_PATTERN = re.compile(r"\b(" + "|".join(_MONTH_NAMES) + r")\b", re.IGNORECASE)
+
+
+@mcp.tool()
+def chunk_timetable_by_month(source_text: str) -> dict:
+    """Split raw timetable text into per-month chunks by detecting month-name
+    boundaries (e.g. '...July 31, 2026 ... August 1, 2026...' splits into a
+    July chunk and an August chunk). Use this BEFORE calling vlm_read_timetable
+    when the acquired source spans much more than one month (e.g. a masjid
+    that publishes a full year at once) — a single VLM call can't reliably
+    extract hundreds of date rows in one response; call vlm_read_timetable
+    once per chunk instead, then merge_extractions to combine the results.
+
+    Returns {"chunks": [{"label": "July", "text": "..."}, ...]}. If no month
+    boundary is found (source is already about one month or less), returns
+    the whole text as a single chunk — safe to call unconditionally."""
+    matches = list(_MONTH_PATTERN.finditer(source_text))
+    if not matches:
+        return {"chunks": [{"label": "", "text": source_text}]}
+
+    boundaries = [matches[0].start()]
+    labels = [matches[0].group(1)]
+    last_month = matches[0].group(1).lower()
+    for m in matches[1:]:
+        month = m.group(1).lower()
+        if month != last_month:
+            boundaries.append(m.start())
+            labels.append(m.group(1))
+            last_month = month
+    boundaries.append(len(source_text))
+
+    chunks = []
+    for i in range(len(boundaries) - 1):
+        text = source_text[boundaries[i]:boundaries[i + 1]].strip()
+        if text:
+            chunks.append({"label": labels[i], "text": text})
+    return {"chunks": chunks}
+
+
 @mcp.tool()
 def find_pdf_link(url: str) -> dict:
     """Return the first likely timetable PDF link found on the page."""

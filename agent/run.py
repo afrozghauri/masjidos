@@ -66,8 +66,9 @@ async def process_masjid(name: str, url: str, source: str = "", row_number: int 
         return {"name": name, "status": "ERROR", "error": str(e)}
 
     mc = _min_conf(extraction)
+    has_estimates = bool(extraction.get("estimated_fields"))
     publish_result = None
-    if mc >= settings.confidence_threshold:
+    if mc >= settings.confidence_threshold and not has_estimates:
         status = "AUTO_PUBLISHED"
         logger.success(f"{name}: auto-published (min conf {mc:.2f})")
         ej = json.dumps(extraction)
@@ -82,7 +83,11 @@ async def process_masjid(name: str, url: str, source: str = "", row_number: int 
         logger.info(f"{name}: CSVs written -> {salah['path']}, {iqamah['path']}")
     else:
         status = "NEEDS_REVIEW"
-        logger.warning(f"{name}: escalated for review (min conf {mc:.2f})")
+        if has_estimates:
+            logger.warning(f"{name}: escalated for review — contains estimated "
+                           f"fields (not real readings): {extraction['estimated_fields']}")
+        else:
+            logger.warning(f"{name}: escalated for review (min conf {mc:.2f})")
 
     _save(name, url, status, mc, extraction, extraction.get("rationale", ""),
          source, row_number, trace)

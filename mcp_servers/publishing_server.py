@@ -16,6 +16,8 @@ from mcp.server.fastmcp import FastMCP
 import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config.settings import settings  # noqa: E402
+from agent.validation import (  # noqa: E402
+    extrapolate_salah_trend, carry_forward_last_value, carry_forward_jumuah)
 
 mcp = FastMCP("publishing")
 
@@ -312,6 +314,156 @@ async def verify_portal_timings(masjid_name: str) -> dict:
         return {"ok": True, "masjid": masjid_name, "salah": salah, "iqamah": iqamah}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+_PORTAL_DATE_FORMATS = ("%d-%b-%Y", "%d %b, %Y", "%d %B, %Y", "%d-%B-%Y")
+_PORTAL_SALAH_COLUMNS = ["date"] + SALAH_HEADER
+_PORTAL_IQAMAH_COLUMNS = ["date", "Fajr", "Dhuhr", "Asr", "Maghrib", "Isha",
+                         "Jumuah 1", "Jumuah 2", "Jumuah 3", "_action"]
+
+
+def _parse_portal_date(raw: str) -> str:
+    raw = raw.strip()
+    for fmt in _PORTAL_DATE_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return raw
+
+
+_PORTAL_EMPTY_PLACEHOLDERS = {"-", "—", "n/a", "na", ""}
+# The portal itself displays "-" for a timing that was never set (observed
+# live: Shah Jahan Mosque's "Jumuah II"/"Jumuah III" columns show "-"). Must
+# be treated as absent, not carried forward as if it were a real value.
+
+
+def _portal_rows_to_dicts(rows: list, columns: list[str]) -> list[dict]:
+    """Turn verify_portal_timings' positional scraped rows into the
+    {"date": ..., "Fajr": ..., ...} shape agent.validation's trend/carry-
+    forward functions expect. Columns starting with '_' are ignored (e.g. the
+    Iqamah table's trailing Action-icons cell, which isn't a real value)."""
+    out = []
+    for r in rows:
+        d = {}
+        for col, val in zip(columns, r):
+            if col == "date":
+                d["date"] = _parse_portal_date(val)
+            elif not col.startswith("_") and val.strip().lower() not in _PORTAL_EMPTY_PLACEHOLDERS:
+                d[col] = val
+        out.append(d)
+    return out
+
+
+@mcp.tool()
+async def fill_missing_from_portal_history(masjid_name: str, extraction_json: str) -> dict:
+    """When the masjid's own website is entirely missing Salah, Iqamah, and/or
+    Jumuah data for one or more columns (genuinely never found — not merely
+    low-confidence, and not not_applicable), fall back to the masjid's OWN
+    existing data already on the Masjidal portal as a baseline:
+
+    - Salah: extrapolate the recent day-over-day TREND (smooth — Salah times
+      are astronomically driven) via extrapolate_salah_trend.
+    - Iqamah (Fajr/Dhuhr/Asr/Isha): CARRY FORWARD the most recent known value,
+      no smoothing — these are set by mosque admins and change in occasional
+      steps, not a trend.
+    - Jumuah: CARRY FORWARD the most recent known value(s) — a fixed weekly
+      time that rarely changes.
+
+    Every field filled this way is recorded in extraction["estimated_fields"]
+    (e.g. ["iqamah.Fajr", "jumuah.Jumuah 1"]) — this is an ESTIMATE, not a
+    real reading, so the confidence gate in agent/run.py checks for this and
+    always escalates to human review regardless of confidence score.
+
+    No-op (extraction returned unchanged) if nothing is actually missing, or
+    if PORTAL_UPLOAD_ENABLED is false (can't reach the portal for history)."""
+    extraction = json.loads(extraction_json)
+    if not settings.portal_upload_enabled:
+        return {"ok": True, "extraction": extraction,
+                "note": "PORTAL_UPLOAD_ENABLED is false; cannot fetch portal history."}
+
+    rows = extraction.get("rows", [])
+    if not rows:
+        return {"ok": True, "extraction": extraction}
+
+    na = extraction.get("not_applicable", {})
+
+    def _column_missing(side, col):
+        if na.get(side, {}).get(col):
+            return False  # genuinely not applicable, not "missing"
+        return not any(str(r.get(side, {}).get(col, "")).strip() for r in rows)
+
+    missing_salah_cols = [c for c in SALAH_HEADER if _column_missing("salah", c)]
+    missing_iqamah_cols = [c for c in ("Fajr", "Dhuhr", "Asr", "Isha") if _column_missing("iqamah", c)]
+    jumuah = extraction.get("jumuah", {})
+    missing_jumuah = [k for k in ("Jumuah 1", "Jumuah 2")
+                      if not na.get("iqamah", {}).get(k) and not str(jumuah.get(k, "")).strip()]
+
+    if not (missing_salah_cols or missing_iqamah_cols or missing_jumuah):
+        return {"ok": True, "extraction": extraction, "note": "Nothing missing; no fallback needed."}
+
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=settings.portal_headless)
+            context = await browser.new_context()
+            page = await context.new_page()
+            portal_page, err = await _login_and_impersonate(context, page, masjid_name)
+            if err:
+                return {"ok": False, "error": err}
+
+            salah_scrape = (await _scrape_table(portal_page, "https://portal.masjidal.com/timings/salah")
+                            if missing_salah_cols else None)
+            iqamah_scrape = (await _scrape_table(portal_page, "https://portal.masjidal.com/timings/iqama")
+                             if (missing_iqamah_cols or missing_jumuah) else None)
+            await browser.close()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    dates = [r.get("date", "") for r in rows]
+    estimated_fields = []
+
+    if missing_salah_cols and salah_scrape:
+        history = _portal_rows_to_dicts(salah_scrape.get("rows", []), _PORTAL_SALAH_COLUMNS)
+        filled = extrapolate_salah_trend(history, dates)
+        for row in rows:
+            for col in missing_salah_cols:
+                val = filled.get(row.get("date", ""), {}).get(col)
+                if val:
+                    row.setdefault("salah", {})[col] = val
+        estimated_fields.extend(f"salah.{c}" for c in missing_salah_cols)
+
+    if iqamah_scrape:
+        history = _portal_rows_to_dicts(iqamah_scrape.get("rows", []), _PORTAL_IQAMAH_COLUMNS)
+        if missing_iqamah_cols:
+            filled = carry_forward_last_value(history, dates, columns=missing_iqamah_cols)
+            for row in rows:
+                for col in missing_iqamah_cols:
+                    val = filled.get(row.get("date", ""), {}).get(col)
+                    if val:
+                        row.setdefault("iqamah", {})[col] = val
+            estimated_fields.extend(f"iqamah.{c}" for c in missing_iqamah_cols)
+
+        if missing_jumuah and history:
+            last = sorted(history, key=lambda r: r.get("date", ""))[-1]
+            filled_jumuah = carry_forward_jumuah(
+                {"Jumuah 1": last.get("Jumuah 1", ""), "Jumuah 2": last.get("Jumuah 2", "")})
+            for k in missing_jumuah:
+                if filled_jumuah.get(k):
+                    jumuah[k] = filled_jumuah[k]
+                    estimated_fields.append(f"jumuah.{k}")
+            extraction["jumuah"] = jumuah
+
+    if estimated_fields:
+        extraction["estimated_fields"] = sorted(set(extraction.get("estimated_fields", [])) | set(estimated_fields))
+        extraction["rationale"] = (
+            extraction.get("rationale", "") +
+            f" [FILLED FROM PORTAL HISTORY: {', '.join(estimated_fields)} were "
+            f"missing from the website entirely; filled from this masjid's own "
+            f"existing portal data (carried forward/trend-extrapolated, not "
+            f"extracted) — flagged for mandatory human review.]")
+
+    return {"ok": True, "extraction": extraction, "estimated_fields": estimated_fields}
 
 
 if __name__ == "__main__":

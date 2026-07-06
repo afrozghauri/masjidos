@@ -94,6 +94,129 @@ def compute_maghrib_iqamah(extraction: dict) -> dict:
     return extraction
 
 
+def minutes_to_clock(total_minutes: int) -> str:
+    """Inverse of to_minutes(): minutes-since-midnight -> '5:12 AM' string."""
+    total_minutes = total_minutes % (24 * 60)
+    h, mn = divmod(total_minutes, 60)
+    period = "AM" if h < 12 else "PM"
+    h12 = h % 12 or 12
+    return f"{h12}:{mn:02d} {period}"
+
+
+SALAH_COLUMNS = ["Fajr", "Sunrise", "Dhuhr", "Asr", "Maghrib", "Isha"]
+IQAMAH_CARRY_FORWARD_COLUMNS = ["Fajr", "Dhuhr", "Asr", "Isha"]
+# Maghrib Iqamah is excluded here — it's always a minutes-difference (see
+# compute_maghrib_iqamah), never a clock time to carry forward.
+
+TREND_HISTORY_DAYS = 14
+# How many of the most recent history days to use when estimating a linear
+# day-over-day trend for Salah times. Long enough to smooth out noise/misreads
+# in the source history; short enough that the trend reflects the CURRENT
+# rate of change (which itself drifts across the year) rather than an average
+# from months ago.
+
+
+def extrapolate_salah_trend(history_rows: list[dict], missing_dates: list[str]) -> dict:
+    """Given a masjid's own recent Salah history (list of {"date": ...,
+    "Fajr": ..., ...} dicts, any order), project a value for each date in
+    missing_dates using a simple linear day-over-day trend computed from the
+    most recent TREND_HISTORY_DAYS of history. Salah times move gradually and
+    smoothly (driven by sunrise/sunset), so a short linear extrapolation is a
+    reasonable estimate for filling a gap of days/weeks. This is NOT a
+    substitute for a real astronomical calculation or a real source reading —
+    callers MUST mark results from this function as estimated, not fact.
+
+    Returns {date: {column: "H:MM AM/PM", ...}, ...} — a column is omitted
+    for a date if there wasn't enough usable history to project it."""
+    history_sorted = sorted(history_rows, key=lambda r: r.get("date", ""))
+    recent = history_sorted[-TREND_HISTORY_DAYS:]
+    result = {date: {} for date in missing_dates}
+    for col in SALAH_COLUMNS:
+        series = [to_minutes(r.get(col, "")) for r in recent]
+        series = [m for m in series if m is not None]
+        if len(series) < 2:
+            continue
+        deltas = [series[i] - series[i - 1] for i in range(1, len(series))]
+        trend = sum(deltas) / len(deltas)
+        last_minutes = series[-1]
+        for i, date in enumerate(sorted(missing_dates), start=1):
+            result[date][col] = minutes_to_clock(round(last_minutes + trend * i))
+    return result
+
+
+def carry_forward_last_value(history_rows: list[dict], missing_dates: list[str],
+                             columns: list[str] = IQAMAH_CARRY_FORWARD_COLUMNS) -> dict:
+    """Iqamah times are set by mosque administrators and change in occasional
+    steps, not a smooth trend — so unlike Salah, the right estimate for a
+    missing date is simply the MOST RECENT known value, held constant, not an
+    extrapolated trend."""
+    history_sorted = sorted(history_rows, key=lambda r: r.get("date", ""))
+    if not history_sorted:
+        return {date: {} for date in missing_dates}
+    last = history_sorted[-1]
+    filled = {col: last[col] for col in columns if last.get(col)}
+    return {date: dict(filled) for date in missing_dates}
+
+
+def carry_forward_jumuah(history_jumuah: dict) -> dict:
+    """Jumuah is a fixed weekly time that rarely changes — carrying forward
+    the last known value(s) is the estimate, not a trend."""
+    return {k: v for k, v in (history_jumuah or {}).items() if v}
+
+
+def merge_extractions(extractions: list[dict]) -> dict:
+    """Combine multiple partial extractions (e.g. one per month, from chunked
+    processing of a source spanning a full year) into one. Rows are
+    concatenated and sorted chronologically; column_confidence takes the
+    MINIMUM across chunks per column (conservative — one bad month shouldn't
+    be hidden behind an average with good months); not_applicable for a
+    column is true only if every chunk that reports it agrees;
+    jumuah/masjid_name/detected_label_scheme are taken from the first chunk
+    that has them (date-independent, so identical across chunks normally)."""
+    if not extractions:
+        return {}
+    merged = {
+        "masjid_name": extractions[0].get("masjid_name", ""),
+        "detected_label_scheme": extractions[0].get("detected_label_scheme", ""),
+        "maghrib_single_column": extractions[0].get("maghrib_single_column", False),
+        "rationale": " | ".join(e.get("rationale", "") for e in extractions if e.get("rationale")),
+    }
+
+    all_rows = []
+    for e in extractions:
+        all_rows.extend(e.get("rows", []))
+    all_rows.sort(key=lambda r: r.get("date", ""))
+    merged["rows"] = all_rows
+
+    cc = {"salah": {}, "iqamah": {}}
+    for side in ("salah", "iqamah"):
+        cols = set()
+        for e in extractions:
+            cols.update(e.get("column_confidence", {}).get(side, {}).keys())
+        for col in cols:
+            vals = [e["column_confidence"][side][col] for e in extractions
+                    if col in e.get("column_confidence", {}).get(side, {})]
+            if vals:
+                cc[side][col] = min(vals)
+    merged["column_confidence"] = cc
+
+    na = {"salah": {}, "iqamah": {}}
+    for side in ("salah", "iqamah"):
+        cols = set()
+        for e in extractions:
+            cols.update(e.get("not_applicable", {}).get(side, {}).keys())
+        for col in cols:
+            relevant = [e["not_applicable"][side][col] for e in extractions
+                       if col in e.get("not_applicable", {}).get(side, {})]
+            na[side][col] = bool(relevant) and all(relevant)
+    merged["not_applicable"] = na
+
+    merged["jumuah"] = next((e["jumuah"] for e in extractions if e.get("jumuah")), {})
+    confs = [e["overall_confidence"] for e in extractions if e.get("overall_confidence") is not None]
+    merged["overall_confidence"] = min(confs) if confs else 0.0
+    return merged
+
+
 def check_consistency(extraction: dict) -> list[str]:
     """Return a list of human-readable contradictions. Empty => consistent.
     Checks every date row in the extraction independently."""

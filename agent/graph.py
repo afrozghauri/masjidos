@@ -55,11 +55,25 @@ fixed path, decide based on what each tool returns:
      and still find nothing usable, stop and return an extraction with
      overall_confidence 0 and rationale explaining you could not locate the
      timetable — do not guess.
-1. (folded into step 0 above.)
+1a. Some masjids publish a FULL YEAR at once rather than a month. If the
+    table_text/page_text you acquired spans much more than one month (many
+    different month names appear, or it just looks huge — hundreds of date-
+    like entries), call chunk_timetable_by_month on it BEFORE calling
+    vlm_read_timetable. A single VLM call cannot reliably extract hundreds of
+    rows in one response.
+    - If it returns only one chunk, proceed normally (step 2, one
+      vlm_read_timetable call on the whole text).
+    - If it returns multiple chunks, call vlm_read_timetable ONCE PER CHUNK
+      (same masjid_name, each chunk's text as source_text), collect every
+      call's "extraction" result as a JSON string, then call
+      merge_extractions with all of them to get back ONE combined
+      extraction. Use that merged extraction for every step from here on
+      (2b onward) instead of a single vlm_read_timetable result.
 2. Call vlm_read_timetable with the FULL table_text/page_text you acquired — do
    not truncate or summarize it yourself before passing it on. The source is
    normally a whole month calendar; the tool needs every date row to extract all
-   of them, not just one day.
+   of them, not just one day. (Skip this if step 1a already produced a merged
+   extraction from chunks.)
 2b. Jumuah (Friday prayer) times are often shown separately from the main daily
     timetable — sometimes only as a text banner/notice on the masjid's HOMEPAGE,
     not on the timetable page you acquired in step 0. If the returned extraction's
@@ -72,6 +86,17 @@ fixed path, decide based on what each tool returns:
     and a contradiction describing the missing Jumuah field, to merge it in. Do
     this at most once — if still not found, leave it as low confidence rather
     than guessing.
+2c. LAST RESORT, after 2b: if Iqamah (Fajr/Dhuhr/Asr/Isha) or Jumuah columns
+    still have no value anywhere in the extraction — genuinely never found on
+    the website or its homepage, not merely low-confidence, and not
+    not_applicable — call fill_missing_from_portal_history with the current
+    extraction JSON. This looks up the masjid's OWN existing data already on
+    the Masjidal portal and fills the gap with a reasonable estimate (a
+    trend for Salah, the last known value for Iqamah/Jumuah), clearly marked
+    in the result's "estimated_fields" so it is never silently treated as a
+    real reading. Use its returned extraction going forward. Only call this
+    once you have genuinely exhausted the website itself — it is a fallback
+    of last resort, not a shortcut to skip acquisition effort.
 3. Call validate_extraction on the returned extraction.
    - If it reports issues, call vlm_recheck_field with the specific contradiction to
      self-correct, then validate again. Do at most 2 correction rounds.

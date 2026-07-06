@@ -125,6 +125,13 @@ for _id, name, status, mc, rationale, ej, item_source, item_row, trace_json in i
                     f"· **Maghrib single column:** {e.get('maghrib_single_column','?')}")
         st.markdown(f"**Agent reasoning:** {e.get('rationale', rationale)}")
 
+        estimated = e.get("estimated_fields")
+        if estimated:
+            st.warning(f"⚠️ Contains ESTIMATED fields, not real readings from the "
+                      f"website — filled from this masjid's own portal history "
+                      f"(trend/carry-forward): {', '.join(estimated)}. Verify "
+                      f"before approving.")
+
         cc = e.get("column_confidence", {})
         na = e.get("not_applicable", {})
         c1, c2 = st.columns(2)

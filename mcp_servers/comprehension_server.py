@@ -22,7 +22,8 @@ from openai import OpenAI
 import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config.settings import settings  # noqa: E402
-from agent.validation import validate_json, compute_maghrib_iqamah  # noqa: E402
+from agent.validation import (  # noqa: E402
+    validate_json, compute_maghrib_iqamah, merge_extractions as _merge_extractions)
 
 mcp = FastMCP("comprehension")
 client = OpenAI(api_key=settings.openai_api_key)
@@ -236,6 +237,23 @@ def vlm_recheck_field(masjid_name: str, contradiction: str,
         extraction = _apply_grounding(_call(blocks), source_text, previous)
         extraction = compute_maghrib_iqamah(extraction)
         return {"ok": True, "extraction": extraction}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+def merge_extractions(extraction_jsons: list[str]) -> dict:
+    """Combine multiple partial extractions (one JSON string per call to
+    vlm_read_timetable) into a single extraction. Use this after processing a
+    source in chunks (via acquisition's chunk_timetable_by_month, for a
+    source spanning much more than one month) — call vlm_read_timetable once
+    per chunk, collect each result's extraction JSON, then pass all of them
+    here to get back the one combined extraction to validate and publish.
+    Rows are concatenated and sorted chronologically; per-column confidence
+    takes the minimum across chunks (conservative)."""
+    try:
+        extractions = [json.loads(s) for s in extraction_jsons]
+        return {"ok": True, "extraction": _merge_extractions(extractions)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
