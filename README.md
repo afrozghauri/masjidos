@@ -60,6 +60,39 @@ Or with Docker:
 docker compose up --build
 ```
 
+## Deploy to Render (real live app link)
+
+`render.yaml` at the repo root is a Render Blueprint that provisions everything
+needed: the backend API, the Streamlit review UI, and a shared Postgres
+database (both services need to see the same review queue, which a plain
+SQLite file can't do across two separate containers).
+
+1. Push this repo to GitHub (already done if you're reading this from there).
+2. In the [Render dashboard](https://dashboard.render.com), **New +** ->
+   **Blueprint**, and point it at the repo. Render reads `render.yaml` and
+   provisions the database + both services automatically.
+3. Render will prompt for the secrets marked `sync: false` in `render.yaml`
+   (`OPENAI_API_KEY`, `API_KEY`, `PORTAL_EMAIL`, `PORTAL_PASSWORD`, and
+   `LANGCHAIN_API_KEY` if you want tracing) — fill these in via its dashboard,
+   never in the repo.
+4. Once deployed, you get real `https://masjidos-backend-xxxx.onrender.com`
+   and `https://masjidos-review-xxxx.onrender.com` links.
+
+Notes specific to this app:
+- `PORTAL_HEADLESS` must stay `true` in `render.yaml` — there's no display on
+  a server. Leave `PORTAL_UPLOAD_ENABLED=false` until you've watched it
+  succeed locally first.
+- Playwright launches a real headless Chromium during portal uploads — if the
+  smallest paid instance type OOMs, size the `masjidos-backend` service up.
+- `data/outputs/` (generated CSVs) and `data/logs/` are NOT persisted across
+  restarts/redeploys in this config (no disk attached) — the review queue
+  itself is safe (it's in Postgres), but generated CSV files are ephemeral.
+  Add a Render disk to `masjidos-backend` if you need those to survive.
+- This Blueprint hasn't been verified against a live Render deploy from this
+  environment (no Render access here) — if the dashboard flags a schema field
+  during sync, the same setting can usually be entered manually for that
+  service (e.g. its "Start Command").
+
 ### Security
 
 Every `app/api.py` route except `/health` requires an `X-API-Key` header matching

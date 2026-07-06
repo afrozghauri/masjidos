@@ -1,6 +1,7 @@
 """Central config. All secrets come from .env — never hardcoded, never in the sheet."""
 import os
 from pathlib import Path
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +27,17 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite:///data/masjidos.db"
     output_dir: str = "data/outputs"
+
+    @field_validator("database_url")
+    @classmethod
+    def _normalize_postgres_scheme(cls, v: str) -> str:
+        # Render/Heroku-style managed Postgres connection strings use the
+        # legacy "postgres://" scheme; SQLAlchemy 1.4+ requires "postgresql://"
+        # and raises otherwise. Normalize here so DATABASE_URL can be wired
+        # straight from the platform's own database without a manual edit.
+        if v.startswith("postgres://"):
+            return "postgresql://" + v[len("postgres://"):]
+        return v
 
     # ---- API security ----
     api_key: str = ""             # required X-API-Key header value for app/api.py

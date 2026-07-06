@@ -1,0 +1,119 @@
+# Render Blueprint — deploys MasjidOS as two services sharing one Postgres
+# database (SQLite can't be shared between separate services/containers, and
+# both the backend and the review UI need to see the same review queue).
+#
+# To deploy: push this repo to GitHub, then in the Render dashboard choose
+# "New +" -> "Blueprint" and point it at the repo. Render reads this file and
+# provisions everything below. Env vars marked `sync: false` are secrets —
+# Render will prompt you to fill them in via the dashboard; they are never
+# stored in this file or the repo.
+#
+# Not verified against a live Render deploy (no Render access from here) —
+# if the dashboard flags a schema field during Blueprint sync, the same
+# setting can be entered manually for that service (e.g. "Start Command").
+
+databases:
+  - name: masjidos-db
+    databaseName: masjidos
+    user: masjidos
+    plan: free
+
+services:
+  - type: web
+    name: masjidos-backend
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    # Playwright launches a real Chromium browser during portal uploads —
+    # if this OOMs on the smallest paid tier, size up to "standard".
+    healthCheckPath: /health
+    dockerCommand: uvicorn app.api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: masjidos-db
+          property: connectionString
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: PORTAL_EMAIL
+        sync: false
+      - key: PORTAL_PASSWORD
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        value: ""
+      - key: MASJID_DIRECTORY
+        value: data/masjids.xlsx
+      - key: CONFIDENCE_THRESHOLD
+        value: "0.80"
+      - key: VLM_MODEL
+        value: gpt-4o
+      - key: AGENT_MODEL
+        value: gpt-4o
+      - key: PORTAL_LOGIN_URL
+        value: https://masjidal.com/backend/site/login
+      - key: PORTAL_UPLOAD_ENABLED
+        value: "false"   # flip to "true" only once you trust the automation
+      - key: PORTAL_HEADLESS
+        value: "true"    # must stay true — no display on a server
+      - key: CORS_ALLOW_ORIGINS
+        value: "*"       # restrict to your real frontend origin(s) if any
+      - key: OUTPUT_DIR
+        value: data/outputs
+      - key: LOG_DIR
+        value: data/logs
+      - key: LANGCHAIN_TRACING_V2
+        value: "false"
+      - key: LANGCHAIN_API_KEY
+        sync: false
+      - key: LANGCHAIN_PROJECT
+        value: masjidos
+
+  - type: web
+    name: masjidos-review
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    dockerCommand: streamlit run app/review_app.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: masjidos-db
+          property: connectionString
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: PORTAL_EMAIL
+        sync: false
+      - key: PORTAL_PASSWORD
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        value: ""
+      - key: MASJID_DIRECTORY
+        value: data/masjids.xlsx
+      - key: CONFIDENCE_THRESHOLD
+        value: "0.80"
+      - key: VLM_MODEL
+        value: gpt-4o
+      - key: AGENT_MODEL
+        value: gpt-4o
+      - key: PORTAL_LOGIN_URL
+        value: https://masjidal.com/backend/site/login
+      - key: PORTAL_UPLOAD_ENABLED
+        value: "false"
+      - key: PORTAL_HEADLESS
+        value: "true"
+      - key: OUTPUT_DIR
+        value: data/outputs
+      - key: LOG_DIR
+        value: data/logs
+      - key: LANGCHAIN_TRACING_V2
+        value: "false"
+      - key: LANGCHAIN_API_KEY
+        sync: false
+      - key: LANGCHAIN_PROJECT
+        value: masjidos
