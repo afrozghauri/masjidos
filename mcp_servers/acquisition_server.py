@@ -2,12 +2,15 @@
 
 Exposes tools the agent uses to GET a timetable from a masjid URL. The agent
 decides which of these to call based on what it observes — it is not a fixed
-pipeline. Each tool returns text or a base64 image the Comprehension server can read.
+pipeline. Each tool returns text, or an image_path the Comprehension server
+can read (see _save_temp_image — NOT raw base64; see that function's docstring
+for why).
 """
-import base64
 import io
-from pathlib import Path
 import re
+import uuid
+from pathlib import Path
+
 import httpx
 import pandas as pd
 import pdfplumber
@@ -21,6 +24,36 @@ from config.settings import settings  # noqa: E402
 mcp = FastMCP("acquisition")
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (MasjidOS timetable agent)"}
+
+TMP_IMAGE_DIR = settings.output_path.parent / "tmp_images"
+
+
+def _save_temp_image(data: bytes) -> str:
+    """Save image bytes to a shared temp file and return its path, instead of
+    returning raw base64 for the agent to shuttle around as a tool-call
+    argument. Observed live: a modest PNG's base64 (~36,000 chars, ~9,000
+    tokens) was too much for the LLM to reliably reproduce verbatim as a
+    function-call argument when passing it from render_image_from_url to
+    vlm_read_timetable — the agent silently stalled with an empty final
+    message instead of erroring, right after receiving the base64 blob.
+    Acquisition and Comprehension run as separate MCP server processes, but
+    share the same filesystem, so a short file path is a safe, cheap handle
+    to pass between them instead."""
+    TMP_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    path = TMP_IMAGE_DIR / f"{uuid.uuid4().hex}.png"
+    path.write_bytes(data)
+    return str(path)
+
+
+def _max_table_rows(tables) -> int:
+    """Row count of the LARGEST table found, as a deterministic signal for
+    whether this is a full calendar or just a 'today at a glance' widget.
+    Observed live: masjid homepages often show a compact today-only snapshot
+    (which is still a real <table> with real prayer times, so has_tables is
+    true) alongside a separate dedicated Timetable page with the actual
+    month. Relying on the LLM to eyeball table_text and guess how many dates
+    it covers is unreliable; a plain row count is not."""
+    return max((len(t.find_all("tr")) for t in tables), default=0)
 
 
 def _visible_text(soup: BeautifulSoup) -> str:
@@ -160,17 +193,23 @@ def fetch_html(url: str) -> dict:
                  if a["href"].lower().endswith(".pdf")]
     imgs = [i.get("src") for i in soup.find_all("img") if i.get("src")]
     page_text = _visible_text(soup)
+    max_rows = _max_table_rows(tables)
     return {
         "ok": True,
         "table_text": table_text[:24000],
         "has_tables": bool(tables),
+        "max_table_rows": max_rows,
         "pdf_links": pdf_links[:5],
         "image_srcs": imgs[:10],
         "page_text": page_text[:6000],
         "note": "If has_tables is False, consider find_pdf_link or render_image_from_url. "
                 "page_text is the general visible text on the page (outside <table> "
                 "tags too) — useful for a Jumuah/Friday-prayer time announced as a "
-                "text banner rather than a table cell.",
+                "text banner rather than a table cell. IMPORTANT: max_table_rows "
+                "small (e.g. <=3) usually means this table is only a 'today at a "
+                "glance' widget, not the full calendar — many masjid homepages show "
+                "one alongside a separate dedicated Timetable page; don't treat a "
+                "small table as sufficient just because has_tables is true.",
     }
 
 
@@ -200,17 +239,22 @@ async def fetch_rendered_html(url: str) -> dict:
                  if a["href"].lower().endswith(".pdf")]
     imgs = [i.get("src") for i in soup.find_all("img") if i.get("src")]
     page_text = _visible_text(soup)
+    max_rows = _max_table_rows(tables)
     return {
         "ok": True,
         "table_text": table_text[:24000],
         "has_tables": bool(tables),
+        "max_table_rows": max_rows,
         "pdf_links": pdf_links[:5],
         "image_srcs": imgs[:10],
         "page_text": page_text[:6000],
         "note": "Rendered with a headless browser (JS executed). If has_tables is "
                 "still False, the timetable may be a canvas/image widget — check "
                 "image_srcs. page_text is the general visible page text, useful for "
-                "a Jumuah/Friday-prayer time announced as a text banner.",
+                "a Jumuah/Friday-prayer time announced as a text banner. IMPORTANT: "
+                "max_table_rows small (e.g. <=3) usually means this is only a "
+                "'today at a glance' widget, not the full calendar — check for a "
+                "separate dedicated Timetable page before settling for it.",
     }
 
 
@@ -286,24 +330,29 @@ def pdf_to_text(pdf_url: str) -> dict:
 
 @mcp.tool()
 def render_pdf_page_image(pdf_url: str, page: int = 0) -> dict:
-    """Render a PDF page to a base64 PNG so the VLM can read image-only PDFs."""
+    """Render a PDF page to a PNG so the VLM can read image-only PDFs. Returns
+    image_path (a local file path), NOT raw base64 — pass that path straight
+    to vlm_read_timetable's image_path argument; do not try to read or
+    reproduce the file's contents yourself."""
     try:
         import fitz  # pymupdf
         data = httpx.get(pdf_url, headers=HEADERS, timeout=60, follow_redirects=True).content
         doc = fitz.open(stream=data, filetype="pdf")
         pix = doc[page].get_pixmap(dpi=150)
-        b64 = base64.b64encode(pix.tobytes("png")).decode()
-        return {"ok": True, "image_base64": b64}
+        return {"ok": True, "image_path": _save_temp_image(pix.tobytes("png"))}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
 @mcp.tool()
 def render_image_from_url(image_url: str) -> dict:
-    """Download an image URL and return it as base64 for the VLM."""
+    """Download an image URL for the VLM to read. Returns image_path (a local
+    file path), NOT raw base64 — pass that path straight to
+    vlm_read_timetable's image_path argument; do not try to read or reproduce
+    the file's contents yourself."""
     try:
         data = httpx.get(image_url, headers=HEADERS, timeout=60, follow_redirects=True).content
-        return {"ok": True, "image_base64": base64.b64encode(data).decode()}
+        return {"ok": True, "image_path": _save_temp_image(data)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 

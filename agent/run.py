@@ -59,6 +59,15 @@ async def process_masjid(name: str, url: str, source: str = "", row_number: int 
         raw, trace = await comprehend(name, url)
         # The agent returns JSON possibly wrapped in prose/backticks — extract it.
         start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            # An empty/no-JSON final message usually means the agent got cut
+            # off mid-exploration (e.g. LangGraph's recursion_limit) rather
+            # than genuinely finishing with prose — the trace shows what it
+            # was doing when that happened.
+            raise ValueError(
+                "Agent's final message contained no JSON — likely cut off "
+                "mid-exploration (recursion limit) rather than finishing "
+                f"normally. Last few trace steps: {trace[-4:]}")
         extraction = json.loads(raw[start:end + 1])
     except Exception as e:
         logger.error(f"{name}: {e}")

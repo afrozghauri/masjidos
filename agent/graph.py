@@ -31,15 +31,36 @@ For the given masjid (name + url), follow this REASONING approach — do not ass
 fixed path, decide based on what each tool returns:
 
 0. Call fetch_html on the given url first.
-   - If has_tables is true and table_text looks like an actual prayer timetable
-     (contains prayer names / time patterns), you may already be done acquiring —
+   - If has_tables is true AND max_table_rows is COMFORTABLY more than a
+     handful (e.g. >=20 — roughly a month of dates), table_text looks like an
+     actual multi-date prayer timetable, you may already be done acquiring —
      skip to step 2.
-   - Otherwise, this is probably just the homepage. Call find_timetable_page on the
-     same url. Look at the returned (text, href) pairs and REASON about which one
-     most plausibly leads to a prayer/Salah/Iqamah timetable — masjids label this
-     inconsistently ("Prayer Times", "Salah Timetable", "Namaz", "Athan", "Timings",
-     "Iqamah", etc.), so match by MEANING, not a fixed keyword. Then call fetch_html
-     on that chosen link.
+   - If has_tables is true but max_table_rows is small (e.g. <=12 — a single
+     day's Fajr/Sunrise/Dhuhr/Asr/Maghrib/Isha(/Jumuah) rows typically land
+     around 7-9), this is very likely a "today at a glance" widget, NOT the
+     full calendar — masjid homepages commonly show one of these alongside a
+     separate dedicated Timetable page or a downloadable PDF (confirmed live:
+     two real masjid homepages both had exactly this — a 7-8 row today-widget
+     table AND a distinct full-month Timetable page/PDF elsewhere). Do NOT
+     treat a small table as sufficient just because a table exists.
+     - Call find_timetable_page first and prefer whatever it finds.
+     - IMPORTANT: some sites inject their "full timetable" / "full prayer
+       times" link via JavaScript (confirmed live: a masjid's real timetable
+       PDF link only existed after JS execution — find_timetable_page, which
+       only sees static HTML, found nothing, while fetch_rendered_html's
+       pdf_links caught it immediately). So if find_timetable_page's links
+       don't turn up anything convincing, call fetch_rendered_html on this
+       SAME url before giving up — check ITS pdf_links/table_text/
+       max_table_rows too, not just table-less pages.
+     - Only fall back to the original small table if nothing better turns up
+       after this search.
+   - Otherwise (no usable table at all), this is probably just the homepage.
+     Call find_timetable_page on the same url. Look at the returned (text, href)
+     pairs and REASON about which one most plausibly leads to a prayer/Salah/
+     Iqamah timetable — masjids label this inconsistently ("Prayer Times",
+     "Salah Timetable", "Namaz", "Athan", "Timings", "Iqamah", "Full Prayer
+     Times", etc.), so match by MEANING, not a fixed keyword. Then call
+     fetch_html on that chosen link, and check ITS max_table_rows too.
    - If that page still has no usable table, decide: is there a pdf_link? call
      find_pdf_link then pdf_to_text. If pdf_to_text reports is_image_pdf true, call
      render_pdf_page_image instead.
@@ -161,7 +182,15 @@ async def comprehend(masjid_name: str, url: str) -> tuple[str, list[dict]]:
     the step-by-step tool-call trace)."""
     agent, _ = await build_agent()
     msg = f"Masjid name: {masjid_name}\nURL: {url}\n\nRead and map this timetable."
-    result = await agent.ainvoke({"messages": [{"role": "user", "content": msg}]})
+    # LangGraph's default recursion_limit (25 steps) was observed live to cut
+    # the agent off mid-exploration — it returns whatever's in state at that
+    # point, which can be an in-progress AIMessage with an empty .content (a
+    # tool call was decided but never executed), silently producing an empty
+    # final_text instead of a clear error. The richer the acquisition
+    # reasoning (yearly chunking, portal-history fallback, JS-render retries),
+    # the more tool-call rounds a masjid can legitimately need.
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": msg}]},
+                                 config={"recursion_limit": 60})
     final_text = result["messages"][-1].content
     trace = _extract_trace(result["messages"])
     return final_text, trace
