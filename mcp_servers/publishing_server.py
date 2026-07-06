@@ -48,21 +48,47 @@ def _fmt_date(raw: str) -> str:
     return raw
 
 
-def _fmt_time(raw: str) -> str:
+_AM_COLUMNS = {"Fajr", "Sunrise"}
+_PM_COLUMNS = {"Dhuhr", "Asr", "Maghrib", "Isha", "Jumuah 1", "Jumuah 2"}
+
+
+def _fmt_time(raw: str, column: str | None = None) -> str:
     """Normalize to zero-padded 12-hour 'HH:MM AM/PM' — matches Masjidal's own
-    sample CSV templates exactly (e.g. '05:16 AM', '12:41 PM'), regardless of the
-    source's original casing/format (e.g. '13:11', '1:11pm', '1:11 PM')."""
+    sample CSV templates exactly (e.g. '05:16 AM', '12:41 PM'), regardless of
+    the source's original casing/format (e.g. '13:11', '1:11pm', '1:11 PM').
+
+    `column` matters when the source omits AM/PM entirely — some tables show
+    e.g. "01:13" for Dhuhr, relying on the reader to know Dhuhr is early
+    afternoon rather than labeling it PM. Domain knowledge is reliable here:
+    Fajr/Sunrise are always AM; Dhuhr/Asr/Maghrib/Isha/Jumuah are always PM.
+    Observed live without this: an unlabeled Dhuhr "01:13" got parsed as a
+    bare 24-hour reading (1:13 AM) — wrong, and it reached a real masjid's
+    live portal before being caught. Resolve from the column instead of
+    guessing 24-hour."""
     raw = (raw or "").strip()
     if not raw:
         return raw
     cleaned = re.sub(r"\s+", " ", raw).upper().replace(".", "")
-    for fmt in ("%I:%M %p", "%I:%M%p", "%H:%M"):
+    for fmt in ("%I:%M %p", "%I:%M%p"):
         try:
             dt = datetime.strptime(cleaned, fmt)
             return dt.strftime("%I:%M %p")
         except ValueError:
             continue
-    return raw  # leave untouched if unrecognized (e.g. already free-form text)
+    if re.match(r"^\d{1,2}:\d{2}$", cleaned):
+        suffix = "AM" if column in _AM_COLUMNS else "PM" if column in _PM_COLUMNS else None
+        if suffix:
+            try:
+                dt = datetime.strptime(f"{cleaned} {suffix}", "%I:%M %p")
+                return dt.strftime("%I:%M %p")
+            except ValueError:
+                pass
+    try:  # no column context (or already looks 24-hour, e.g. "13:11") — fall
+          # back to a plain 24-hour reading.
+        dt = datetime.strptime(cleaned, "%H:%M")
+        return dt.strftime("%I:%M %p")
+    except ValueError:
+        return raw  # leave untouched if unrecognized (e.g. already free-form text)
 
 
 @mcp.tool()
@@ -76,7 +102,7 @@ def generate_salah_csv(masjid_name: str, extraction_json: str) -> dict:
         for row in e.get("rows", []):
             salah = row.get("salah", {})
             w.writerow([_fmt_date(row.get("date", ""))] +
-                       [_fmt_time(salah.get(c, "")) for c in SALAH_HEADER])
+                       [_fmt_time(salah.get(c, ""), column=c) for c in SALAH_HEADER])
     return {"ok": True, "path": str(path), "rows": len(e.get("rows", []))}
 
 
@@ -93,11 +119,11 @@ def generate_iqamah_csv(masjid_name: str, extraction_json: str) -> dict:
         w.writerow(["Date"] + IQAMAH_HEADER)
         for row in e.get("rows", []):
             iq = row.get("iqamah", {})
-            values = [_fmt_time(iq.get(c, "")) for c in ("Fajr", "Dhuhr", "Asr")]
+            values = [_fmt_time(iq.get(c, ""), column=c) for c in ("Fajr", "Dhuhr", "Asr")]
             values.append(str(iq.get("Maghrib", "")).strip())  # minutes-diff, not a time
-            values.append(_fmt_time(iq.get("Isha", "")))
-            values.append(_fmt_time(jumuah.get("Jumuah 1", "")))
-            values.append(_fmt_time(jumuah.get("Jumuah 2", "")))
+            values.append(_fmt_time(iq.get("Isha", ""), column="Isha"))
+            values.append(_fmt_time(jumuah.get("Jumuah 1", ""), column="Jumuah 1"))
+            values.append(_fmt_time(jumuah.get("Jumuah 2", ""), column="Jumuah 2"))
             w.writerow([_fmt_date(row.get("date", ""))] + values)
     return {"ok": True, "path": str(path), "rows": len(e.get("rows", []))}
 

@@ -46,6 +46,38 @@ def test_maghrib_iqamah_leaves_existing_diff_alone():
     assert out["rows"][0]["iqamah"]["Maghrib"] == "5"
 
 
+def test_maghrib_iqamah_rejects_implausibly_large_gap():
+    # Observed live: a source with Maghrib single-column but neighboring
+    # prayers double-column confused the VLM into reporting Isha's begin time
+    # (9:27 PM Maghrib -> 10:42 PM "iqamah") as if it were Maghrib's jamaat —
+    # a 75-minute gap. Must be rejected, not trusted.
+    e = {"rows": [{"date": "2026-07-01",
+                   "salah": {"Maghrib": "9:27 PM"},
+                   "iqamah": {"Maghrib": "10:42 PM"}}]}
+    out = compute_maghrib_iqamah(e)
+    assert out["rows"][0]["iqamah"]["Maghrib"] == "1"
+    assert "SANITY CHECK" in out["rationale"]
+
+
+def test_maghrib_iqamah_confidence_always_certain():
+    # This field's correctness is now fully deterministic (computed or safely
+    # defaulted), so it should never drag the confidence gate into escalating
+    # a masjid to human review just because of Maghrib column ambiguity.
+    e = {"rows": [{"date": "2026-07-01",
+                   "salah": {"Maghrib": "9:27 PM"},
+                   "iqamah": {"Maghrib": ""}}]}
+    out = compute_maghrib_iqamah(e)
+    assert out["column_confidence"]["iqamah"]["Maghrib"] == 1.0
+
+
+def test_maghrib_iqamah_rejects_stale_large_diff_carried_forward():
+    e = {"rows": [{"date": "2026-07-01",
+                   "salah": {"Maghrib": "9:27 PM"},
+                   "iqamah": {"Maghrib": "75"}}]}
+    out = compute_maghrib_iqamah(e)
+    assert out["rows"][0]["iqamah"]["Maghrib"] == "1"
+
+
 def test_maghrib_must_be_minutes_not_clock():
     e = {"rows": [{"date": "2026-07-01", "salah": {}, "iqamah": {"Maghrib": "9:15 PM"}}]}
     r = validate_json(json.dumps(e))

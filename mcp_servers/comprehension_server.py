@@ -49,6 +49,17 @@ to get right and easy for you to get subtly wrong across many rows. If Maghrib
 has only ONE column in the source (no separate jamaat time), leave this field
 EMPTY — the deterministic step defaults that to "1".
 
+Sources are often INCONSISTENT about how many columns each prayer gets — e.g.
+Fajr/Dhuhr/Asr/Isha may each show two sub-columns (Begin, Jama'ah) while
+Maghrib shows only ONE. Do not assume every prayer has the same column count.
+If you find yourself about to fill Maghrib's jamaat with a value that looks
+like it belongs to the NEXT prayer (Isha) rather than something genuinely
+under a Maghrib heading, that is a sign Maghrib is single-column here — leave
+it EMPTY rather than borrowing a neighboring column's value. In real practice
+Maghrib jamaat is almost always within a few minutes of its begin time (the
+prayer window is narrow); a value that implies a gap of 20+ minutes is far
+more likely a misread than a real timing.
+
 Jumuah (Friday prayer) is DIFFERENT: it is normally one fixed weekly time (or two,
 if there are two sessions), not something that changes by date. Report it ONCE,
 not per-date, in a separate "jumuah" object: {"Jumuah 1": str, "Jumuah 2": str}.
