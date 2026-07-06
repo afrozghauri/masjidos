@@ -24,7 +24,34 @@ st.title("MasjidOS — Timetable Review Gate")
 st.caption("Only cases the agent judged too uncertain to auto-publish need you.")
 
 st.divider()
-st.subheader("1. Load the masjid directory")
+st.subheader("1. Quick add: run a single masjid")
+st.caption("Paste a name + website URL to process just one masjid right now.")
+
+qc1, qc2, qc3 = st.columns([2, 3, 1])
+with qc1:
+    quick_name = st.text_input("Masjid name", key="quick_name")
+with qc2:
+    quick_url = st.text_input("Website URL", key="quick_url",
+                              placeholder="https://example.com/prayer-times")
+with qc3:
+    st.write("")  # spacer so the button lines up with the inputs
+    quick_run_clicked = st.button("Run", type="primary",
+                                  disabled=not (quick_name and quick_url))
+
+if quick_run_clicked and quick_name and quick_url:
+    from agent.run import process_masjid
+    with st.spinner(f"Processing {quick_name}..."):
+        result = asyncio.run(process_masjid(quick_name, quick_url))
+    if result.get("status") == "ERROR":
+        st.error(f"Failed: {result.get('error')}")
+    else:
+        st.success(f"{quick_name}: {result['status']} "
+                   f"(min confidence {result.get('min_confidence', 0):.2f}). "
+                   f"See the queue below.")
+        st.rerun()
+
+st.divider()
+st.subheader("2. Or load a full masjid directory")
 
 mode = st.radio("Source", ["Google Sheet link", "Upload Excel/CSV file"], horizontal=True)
 
@@ -66,7 +93,7 @@ if run_clicked and source:
         st.rerun()
 
 st.divider()
-st.subheader("2. Review queue")
+st.subheader("3. Review queue")
 
 
 def load():
