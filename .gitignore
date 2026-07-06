@@ -10,3 +10,4 @@ data/logs/
 config/service_account.json
 *.json.key
 .scratch/
+.claude/

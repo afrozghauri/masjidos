@@ -20,6 +20,28 @@ def to_minutes(t: str):
     return h * 60 + mn
 
 
+def compute_maghrib_iqamah(extraction: dict) -> dict:
+    """Deterministically compute each date's Maghrib Iqamah value as the number
+    of minutes after Salah (begin) time, rather than trusting the VLM to do this
+    arithmetic itself. The VLM is only asked for the raw Iqamah/Jama'ah clock
+    time (or to leave it empty if the source has a single Maghrib column) —
+    this function does the subtraction. Convention: "1" when there's no second
+    column, no parseable time, or the computed difference is zero or negative."""
+    for row in extraction.get("rows", []):
+        iq = row.setdefault("iqamah", {})
+        raw = str(iq.get("Maghrib", "")).strip()
+        if raw.lstrip("-").isdigit():
+            continue  # already a diff (e.g. carried forward from a prior round)
+        salah_m = to_minutes(row.get("salah", {}).get("Maghrib", ""))
+        iqamah_m = to_minutes(raw)
+        if salah_m is None or iqamah_m is None:
+            iq["Maghrib"] = "1"
+            continue
+        diff = iqamah_m - salah_m
+        iq["Maghrib"] = str(diff) if diff > 0 else "1"
+    return extraction
+
+
 def check_consistency(extraction: dict) -> list[str]:
     """Return a list of human-readable contradictions. Empty => consistent.
     Checks every date row in the extraction independently."""

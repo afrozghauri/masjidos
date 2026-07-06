@@ -22,7 +22,7 @@ from openai import OpenAI
 import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config.settings import settings  # noqa: E402
-from agent.validation import validate_json  # noqa: E402
+from agent.validation import validate_json, compute_maghrib_iqamah  # noqa: E402
 
 mcp = FastMCP("comprehension")
 client = OpenAI(api_key=settings.openai_api_key)
@@ -41,11 +41,13 @@ Canonical per-date columns:
 - Salah, in order: Fajr, Sunrise, Dhuhr, Asr, Maghrib, Isha
 - Iqamah, in order: Fajr, Dhuhr, Asr, Maghrib, Isha
 
-Special Maghrib rule for the IQAMAH side: do NOT output a clock time. Output the
-NUMBER OF MINUTES between that date's Maghrib begin (Salah) and Maghrib jamaat
-(Iqamah). If Maghrib has only ONE column, or begin == jamaat, output "1". This is
-usually the same number every date, but compute it per-date if the source shows
-distinct begin/jamaat clock times per date.
+Special Maghrib rule for the IQAMAH side: output the RAW CLOCK TIME of that
+date's Maghrib jamaat (Iqamah), same format as every other time — e.g. "9:28 PM".
+Do NOT compute a minutes-difference yourself; a deterministic step afterward
+subtracts it from the Salah (begin) time, since that arithmetic is easy for code
+to get right and easy for you to get subtly wrong across many rows. If Maghrib
+has only ONE column in the source (no separate jamaat time), leave this field
+EMPTY — the deterministic step defaults that to "1".
 
 Jumuah (Friday prayer) is DIFFERENT: it is normally one fixed weekly time (or two,
 if there are two sessions), not something that changes by date. Report it ONCE,
@@ -194,6 +196,7 @@ def vlm_read_timetable(masjid_name: str, source_text: str = "",
                        "image_url": {"url": f"data:image/png;base64,{image_base64}"}})
     try:
         extraction = _apply_grounding(_call(blocks), source_text)
+        extraction = compute_maghrib_iqamah(extraction)
         return {"ok": True, "extraction": extraction}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -220,6 +223,7 @@ def vlm_recheck_field(masjid_name: str, contradiction: str,
         except Exception:
             previous = None
         extraction = _apply_grounding(_call(blocks), source_text, previous)
+        extraction = compute_maghrib_iqamah(extraction)
         return {"ok": True, "extraction": extraction}
     except Exception as e:
         return {"ok": False, "error": str(e)}

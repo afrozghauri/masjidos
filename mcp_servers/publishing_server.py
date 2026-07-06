@@ -102,6 +102,60 @@ def generate_iqamah_csv(masjid_name: str, extraction_json: str) -> dict:
     return {"ok": True, "path": str(path), "rows": len(e.get("rows", []))}
 
 
+async def _login_and_impersonate(context, page, masjid_name: str):
+    """Shared flow for portal_upload and verify_portal_timings: log into the
+    backend admin, search Mosque Manager, click the matching row's 'New UI
+    Login' icon, and return the resulting authenticated portal tab.
+    Returns (portal_page, error) — exactly one is None."""
+    await page.goto(settings.portal_login_url, wait_until="networkidle", timeout=30000)
+    await page.fill("input[name='LoginForm[email]']", settings.portal_email)
+    await page.fill("input[name='LoginForm[password]']", settings.portal_password)
+    await page.click("button[type=submit]")
+    await page.wait_for_load_state("networkidle", timeout=30000)
+
+    await page.goto("https://masjidal.com/backend/mosque", wait_until="networkidle", timeout=30000)
+    await page.fill("input[name='MasjidSearch[m_name]']", masjid_name)
+    await page.keyboard.press("Enter")
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    # The search re-renders the grid after networkidle resolves; querying too
+    # early destroys the execution context mid-navigation. Wait for the grid
+    # itself before touching it (same fix needed during exploration — see
+    # explore_portal9.py).
+    await page.wait_for_selector("table tbody tr", timeout=15000)
+
+    rows = await page.query_selector_all("table tbody tr")
+    target_row = None
+    for r in rows:
+        cells = await r.query_selector_all("td")
+        if len(cells) > 1 and (await cells[1].inner_text()).strip().lower() == masjid_name.strip().lower():
+            target_row = r
+            break
+    target_row = target_row or (rows[0] if rows else None)
+    if not target_row:
+        return None, f"No mosque found in Mosque Manager matching '{masjid_name}'."
+
+    new_ui_link = await target_row.query_selector("a[href*='backend/portal/login']")
+    if not new_ui_link:
+        return None, f"'{masjid_name}' row has no New UI Login link."
+
+    async with context.expect_page(timeout=20000) as new_page_info:
+        await new_ui_link.click()
+    portal_page = await new_page_info.value
+    await portal_page.wait_for_load_state("networkidle", timeout=30000)
+    return portal_page, None
+
+
+async def _scrape_table(page, url: str) -> dict:
+    await page.goto(url, wait_until="networkidle", timeout=30000)
+    await page.wait_for_timeout(1500)  # let any client-side calendar render finish
+    headers = await page.eval_on_selector_all(
+        "table thead th, table th", "els => els.map(e => e.innerText.trim())")
+    rows = await page.eval_on_selector_all(
+        "table tbody tr",
+        "trs => trs.map(tr => Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim()))")
+    return {"headers": headers, "rows": rows}
+
+
 @mcp.tool()
 async def portal_upload(masjid_name: str, salah_csv: str, iqamah_csv: str) -> dict:
     """Deterministic Playwright automation against the REAL Masjidal system,
@@ -113,17 +167,26 @@ async def portal_upload(masjid_name: str, salah_csv: str, iqamah_csv: str) -> di
        row's "New UI Login" icon opens a NEW TAB (window.open) that lands,
        already authenticated via a one-time JWT, on the mosque-facing frontend
        at portal.masjidal.com/dashboard/.
-    3. On that tab: /timings/salah -> "Upload Timings" -> file chooser ->
-       "Upload"; then /timings/iqama -> "Upload" -> file chooser -> "Upload".
+    3. On that tab: /timings/salah -> "Upload Timings" (EXACT text match — the
+       page header's "Upload Logo" control also contains the substring
+       "Upload", so a substring match can silently click the wrong element) ->
+       file chooser -> "SELECT CSV FILE" -> modal's "Upload" submit button ->
+       if uploaded dates overlap existing entries, a CUSTOM in-page popup asks
+       "Do you want to overwrite record or show old record" (Yes/No buttons —
+       confirmed NOT a native browser dialog, since Chromium's native
+       confirm() can only ever show "OK"/"Cancel", never custom labels; a
+       page.on("dialog") handler never sees this) -> click "Yes". Then the
+       same for /timings/iqama with its "Upload" button (exact match).
 
-    Two things are inference, not confirmed against raw HTML (no direct DOM
-    access was available while building this — only screenshots): the exact
-    modal "Upload" submit button (there are TWO buttons with overlapping text,
-    the nav button that opens the modal and the modal's own submit button; we
-    take the LAST match on the theory that modals are appended to the DOM
-    after their trigger), and the mosque-name search assumes an exact-match
-    row exists. Test with PORTAL_HEADLESS=false first to watch it run, ideally
-    against a non-critical masjid, before trusting it broadly.
+    Full-month uploads for both Salah and Iqamah, including the overwrite
+    confirmation, are confirmed working end-to-end against the live portal
+    (2026-07) — verified by reading the result back with
+    verify_portal_timings() rather than trusting this function's "ok" alone.
+
+    One thing remains inference, not confirmed against raw HTML: the mosque-
+    name search assumes an exact-match row exists in Mosque Manager. Test with
+    PORTAL_HEADLESS=false first against any new masjid, ideally non-critical,
+    before trusting it broadly.
 
     No-op unless PORTAL_UPLOAD_ENABLED."""
     if not settings.portal_upload_enabled:
@@ -137,48 +200,47 @@ async def portal_upload(masjid_name: str, salah_csv: str, iqamah_csv: str) -> di
             context = await browser.new_context()
             page = await context.new_page()
 
-            await page.goto(settings.portal_login_url, wait_until="networkidle", timeout=30000)
-            await page.fill("input[name='LoginForm[email]']", settings.portal_email)
-            await page.fill("input[name='LoginForm[password]']", settings.portal_password)
-            await page.click("button[type=submit]")
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            portal_page, err = await _login_and_impersonate(context, page, masjid_name)
+            if err:
+                return {"ok": False, "error": err}
 
-            await page.goto("https://masjidal.com/backend/mosque", wait_until="networkidle", timeout=30000)
-            await page.fill("input[name='MasjidSearch[m_name]']", masjid_name)
-            await page.keyboard.press("Enter")
-            await page.wait_for_load_state("networkidle", timeout=30000)
-
-            rows = await page.query_selector_all("table tbody tr")
-            target_row = None
-            for r in rows:
-                cells = await r.query_selector_all("td")
-                if len(cells) > 1 and (await cells[1].inner_text()).strip().lower() == masjid_name.strip().lower():
-                    target_row = r
-                    break
-            target_row = target_row or (rows[0] if rows else None)
-            if not target_row:
-                return {"ok": False, "error": f"No mosque found in Mosque Manager matching '{masjid_name}'."}
-
-            new_ui_link = await target_row.query_selector("a[href*='backend/portal/login']")
-            if not new_ui_link:
-                return {"ok": False, "error": f"'{masjid_name}' row has no New UI Login link."}
-
-            async with context.expect_page(timeout=20000) as new_page_info:
-                await new_ui_link.click()
-            portal_page = await new_page_info.value
-            await portal_page.wait_for_load_state("networkidle", timeout=30000)
+            # Belt-and-braces: accept any NATIVE browser dialog that might show
+            # up (e.g. a beforeunload prompt if we navigate away too early).
+            # This is NOT what handles the overwrite confirmation below — see
+            # that comment for why.
+            async def _accept_dialog(dialog):
+                await dialog.accept()
+            portal_page.on("dialog", _accept_dialog)
 
             for url, filename, csv_path in (
                 ("https://portal.masjidal.com/timings/salah", "Upload Timings", salah_csv),
                 ("https://portal.masjidal.com/timings/iqama", "Upload", iqamah_csv),
             ):
                 await portal_page.goto(url, wait_until="networkidle", timeout=30000)
-                await portal_page.click(f"text={filename}")
+                # Exact match, not substring: every page has an "Upload Logo"
+                # control in the header, and a bare `text=Upload` substring
+                # match can silently click that instead of the real button —
+                # confirmed live as the cause of the Iqamah upload never
+                # opening its modal.
+                await portal_page.click(f'text="{filename}"')
                 async with portal_page.expect_file_chooser() as fc_info:
                     await portal_page.click("text=SELECT CSV FILE")
                 await (await fc_info.value).set_files(csv_path)
                 await portal_page.wait_for_selector(f"text={Path(csv_path).name}", timeout=10000)
                 await portal_page.locator("button:has-text('Upload')").last.click()
+                # Uploading dates that overlap existing entries shows a CUSTOM
+                # in-page popup — "Do you want to overwrite record or show old
+                # record", with Yes/No buttons. Confirmed live: this is not a
+                # native browser dialog (Chromium's native confirm() can only
+                # ever show "OK"/"Cancel", never custom labels), so
+                # page.on("dialog") above never sees it — that was the actual
+                # bug behind only a single (non-overlapping) date landing.
+                # Click "Yes" directly; skip silently if no overlap means it
+                # never appears.
+                try:
+                    await portal_page.locator("button:has-text('Yes')").click(timeout=5000)
+                except Exception:
+                    pass
                 await portal_page.wait_for_timeout(2000)
 
             await browser.close()
@@ -187,6 +249,43 @@ async def portal_upload(masjid_name: str, salah_csv: str, iqamah_csv: str) -> di
         return {"ok": False, "error": str(e),
                 "hint": "Verify against the live DOM — see portal_upload's docstring "
                         "for which parts are inference vs. confirmed."}
+
+
+@mcp.tool()
+async def verify_portal_timings(masjid_name: str) -> dict:
+    """Read-only: log in and impersonate into the given masjid's portal (same
+    flow as portal_upload), then scrape whatever the Salah Timings and Iqamah
+    Timings pages CURRENTLY display. Exists so success can be confirmed by
+    reading the portal back, rather than trusting portal_upload's own "ok"
+    alone — that was essential during development, since portal_upload
+    reported "ok" even on runs where the upload silently didn't take effect.
+
+    Note: the Iqamah Timings table appears to be paginated — this scrapes
+    only whatever page is showing by default (observed: the most recent ~25
+    rows), not the full calendar. Fine for a spot-check; not a substitute for
+    counting rows if you need to confirm every date landed.
+
+    No-op unless PORTAL_UPLOAD_ENABLED (same live-system gate as portal_upload)."""
+    if not settings.portal_upload_enabled:
+        return {"ok": False, "error": "PORTAL_UPLOAD_ENABLED is false; nothing to verify against."}
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=settings.portal_headless)
+            context = await browser.new_context()
+            page = await context.new_page()
+
+            portal_page, err = await _login_and_impersonate(context, page, masjid_name)
+            if err:
+                return {"ok": False, "error": err}
+
+            salah = await _scrape_table(portal_page, "https://portal.masjidal.com/timings/salah")
+            iqamah = await _scrape_table(portal_page, "https://portal.masjidal.com/timings/iqama")
+
+            await browser.close()
+        return {"ok": True, "masjid": masjid_name, "salah": salah, "iqamah": iqamah}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 if __name__ == "__main__":
